@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Slide Extractor</title>
+    <script src="https://bundle.run/pixelmatch@5.1.0"></script>
+    <script src="https://unpkg.com/jspdf@latest/dist/jspdf.umd.min.js"></script>
+</head>
+<body>
+<h1>Slide Extractor</h1>
+<span>Using https://github.com/parallax/jsPDF (PDF creation) & https://github.com/mapbox/pixelmatch (slide compare)</span>
+<br>
+<span>Extracts different slides by pixel wise matching between frames (e.g. presentation slides without embedded speaker).</span>
+
+<div style="margin-top: 2em; margin-bottom: 2em; width: 100%; display: flex;">
+    <div style="width: 33%;">
+        <input style="height: 5em;" type="file" id="video" accept="video/*"/>
+        <div id="message"></div>
+    </div>
+    <div style="width: 33%;">
+        <video style="max-height: 150px;" autoplay></video>
+    </div>
+    <div style="width: 33%;">
+        <button id="download" onclick="saveAsPdf()" disabled>Als PDF speichern</button>
+    </div>
+    <div>
+        <span>Einstellungen</span>
+        <div>Framerate (Geschwindigkeit): <input type="number" id="framerate" value="1"></div>
+        <div>Pixel Diff (Genauigkeit): <input type="number" id="pixeldiff" value="1000"></div>
+        <button onclick="reset()">Reset</button>
+    </div>
+</div>
+
+<progress style="width: 100%;" id="prog" value="0" max="100"></progress>
+
+<h3>Slides <span id="slide-count"></span></h3>
+<div id="slides" style="height: 400px; overflow: auto;"></div>
+<script type="application/javascript">
+    const { jsPDF } = window.jspdf;
+
+    let videoWidth, videoHeight, videoDuration, seekResolve, running;
+    const progress = document.querySelector("#prog");
+    const download = document.querySelector("#download");
+    const videoNode = document.querySelector('video');
+    const inputNode = document.querySelector('#video');
+    const framerateNode = document.querySelector('#framerate');
+    const pixeldiffNode = document.querySelector('#pixeldiff');
+    const slideCountNode = document.querySelector("#slide-count");
+
+    // Framerate setzen
+    let interval = 1 / 0.5; //FPS
+    function changeFPS (e) {
+        let value = e.target.value;
+        interval = 1 / value;
+    }
+
+    // Pixel Unterschied zwischen zwei frames
+    let pixelDiff = 1000;
+    function changePixelDiff (e) {
+        let value = e.target.value;
+        pixelDiff = value;
+    }
+
+    // reset form
+    function reset(){
+        interval = 1 / 0.5;
+        pixelDiff = 1000;
+        inputNode.value = inputNode.defaultValue;
+        download.disabled = true;
+        document.querySelector("#slides").innerHTML = "";
+        videoNode.src = "";
+        progress.max = 100;
+        progress.value = 0;
+        running = false;
+    }
+
+    // Speichern als PDF
+    function saveAsPdf() {
+        // Alle extrahierten frames nutzen
+        let canvases = document.querySelectorAll("#slides canvas");
+
+        // PDF mit der Seitengröße des Input Videos
+        const doc = new jsPDF({
+            orientation: "landscape",
+            unit: "px",
+            format: [videoWidth, videoHeight],
+            hotfixes: [
+                "px_scaling"
+            ]
+        });
+
+        // Für jedes canvas eine neue Seite
+        for (let i = -1; ++i < canvases.length;) {
+            doc.addPage([videoWidth, videoHeight]);
+            doc.addImage(canvases[i], "JPEG", 0, 0, videoWidth, videoHeight);
+        }
+
+        doc.save();
+    }
+
+    const URL = window.URL || window.webkitURL;
+    const displayMessage = function (message, isError) {
+        const element = document.querySelector('#message');
+        element.innerHTML = message
+        element.className = isError ? 'error' : 'info'
+    };
+
+    const playSelectedFile = async function (event) {
+        const file = this.files[0];
+        const type = file.type;
+        let canPlay = videoNode.canPlayType(type);
+        if (canPlay === '') canPlay = 'no'
+        const message = 'Video Format "' + type + '": ' + canPlay;
+        const isError = canPlay === 'no';
+        displayMessage(message, isError)
+
+        download.disabled = true;
+        document.querySelector("#slides").innerHTML = "";
+
+        if (isError) {
+            return
+        }
+
+        const fileURL = URL.createObjectURL(file);
+        videoNode.src = fileURL;
+
+        // frame by frame
+        videoNode.addEventListener('seeked', async function () {
+            if (seekResolve) seekResolve();
+        });
+
+        // workaround chromium metadata bug (https://stackoverflow.com/q/38062864/993683)
+        while ((videoNode.duration === Infinity || isNaN(videoNode.duration)) && videoNode.readyState < 2) {
+            await new Promise(r => setTimeout(r, 1000));
+            videoNode.currentTime = 10000000 * Math.random();
+        }
+
+        videoWidth = videoNode.videoWidth;
+        videoHeight = videoNode.videoHeight;
+        videoDuration = videoNode.duration;
+
+        // Platzhalter für den aktuellen Video Frame
+        let canvas = document.createElement('canvas');
+        let context = canvas.getContext('2d');
+        canvas.width = videoWidth;
+        canvas.height = videoHeight;
+
+        // Platzhalter für das vorhergehende Video Frame
+        let prevCanvas = document.createElement("canvas");
+        prevCanvas.width = videoWidth;
+        prevCanvas.height = videoHeight;
+        let prevCanvasCtx = prevCanvas.getContext("2d");
+
+        let currentTime = 0, slideCount = 0;
+        progress.max = videoDuration;
+        progress.value = 0;
+        slideCountNode.innerHTML = `(Gefunden: ${slideCount})`;
+
+        running = true; // externe Abbruchbedingung
+        while (currentTime < videoDuration && running) {
+            videoNode.currentTime = currentTime;
+            progress.value = currentTime;
+
+            await new Promise(r => seekResolve = r);
+
+            // Frame in Platzhalter laden
+            context.drawImage(videoNode, 0, 0, videoWidth, videoHeight);
+
+            const img1 = context.getImageData(0, 0, videoWidth, videoHeight);
+            const img2 = prevCanvasCtx.getImageData(0, 0, videoWidth, videoHeight);
+
+            // Ersten Frame überspingen
+            if (currentTime > 0) {
+                // Matching der beiden Frames
+                let differentPixels = pixelmatch(img1.data, img2.data, null, videoWidth, videoHeight, {threshold: 0.10});
+
+                // Falls die Änderung zwischen beiden groß genug ist, als Slide speichern
+                if (differentPixels > pixelDiff) {
+                    console.log("new slide");
+                    slideCount++;
+
+                    slideCountNode.innerHTML = `(Gefunden: ${slideCount})`;
+
+                    let result = document.createElement("canvas");
+                    result.height = videoHeight;
+                    result.width = videoWidth;
+                    result.getContext("2d").drawImage(videoNode, 0, 0);
+                    document.querySelector("#slides").appendChild(result);
+                }
+            }
+
+            // Vor Ende der Schleife den aktuellen Frame als letzten Frame setzen
+            prevCanvasCtx.drawImage(videoNode, 0, 0);
+
+            // zum nächsten Video Frame springen
+            currentTime += interval;
+        }
+
+        progress.max = 100;
+        progress.value = 100;
+        download.disabled = false;
+    };
+
+    inputNode.addEventListener('change', playSelectedFile, false);
+    framerateNode.addEventListener('change', changeFPS, false);
+    pixeldiffNode.addEventListener('change', changePixelDiff, false);
+</script>
+</body>
+</html>
